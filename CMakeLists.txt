@@ -31,10 +31,13 @@ project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
 # Enable CMake support for ASM and C languages
-enable_language(C ASM)
+enable_language(C CXX ASM)
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
+
+# Print the project name
+message("Project name: " ${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
