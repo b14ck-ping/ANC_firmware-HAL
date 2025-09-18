@@ -1,0 +1,8 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "C_Cpp.default.configurationProvider": "null",
+  "C_Cpp.errorSquiggles": "enabled"
+  // "C_Cpp.default.compilerPath": "/usr/bin/arm-none-eabi-gcc"
+
+}
+

@@ -18,14 +18,14 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "dac.h"
+#include "dma.h"
 #include "sai.h"
 #include "usart.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +35,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TABLE_SIZE   128
+#define CHANNELS     2 // стерео
+#define AMP          500
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,7 +48,8 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+static int16_t sine_lut[TABLE_SIZE];
+static int16_t i2s_tx_buf[TABLE_SIZE * CHANNELS];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,13 +61,74 @@ void PeriphCommonClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+static void FillSine(void)
+{
+    for (int i = 0; i < TABLE_SIZE; ++i) {
+        float t = (2.0f * 3.1415926535f * i) / TABLE_SIZE;
+        int16_t s = (int16_t)(AMP * sinf(t));
+        // interleaved L/R
+        i2s_tx_buf[2*i + 0] = 0; // Left
+        i2s_tx_buf[2*i + 1] = s; // Right (моно в стерео)
+    }
+}
 /* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
   * @retval int
   */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_SAI1_Init();
+  MX_USART1_UART_Init();
+  /* USER CODE BEGIN 2 */
+  FillSine();
+
+  // В HAL_SAI_Transmit_DMA "Size" — это КОЛ-ВО 16-БИТНЫХ элементов при DataSize=16
+  if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
+                            (uint8_t*)i2s_tx_buf,
+                            sizeof(i2s_tx_buf)/sizeof(uint16_t)) != HAL_OK) {
+      Error_Handler();
+  }
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
 
 /**
   * @brief System Clock Configuration

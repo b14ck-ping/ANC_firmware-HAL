@@ -8,7 +8,7 @@
             "name": "Build & Debug Microcontroller - ST-Link",
             "cwd": "${workspaceFolder}",
             "type": "cortex-debug",
-            "executable": "${command:cmake.launchTargetPath}",
+            "executable": "${workspaceFolder}/build/Debug/ANC.elf",//"${command:cmake.launchTargetPath}",
             // Let CMake extension decide executable: "${command:cmake.launchTargetPath}"
             // Or fixed file path: "${workspaceFolder}/path/to/filename.elf"
             "request": "launch",
@@ -27,6 +27,7 @@
             "serverArgs": [
                 "-m","0",
             ],
+            "showDevDebugOutput" : "raw",
             //"preLaunchTask": "Build + Flash"
             /* If you use external loader, add additional arguments */
             //"serverArgs": ["--extload", "path/to/ext/loader.stldr"],
