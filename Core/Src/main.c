@@ -18,8 +18,10 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "dac.h"
 #include "dma.h"
-#include "sai.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -35,42 +37,38 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TABLE_SIZE   128
-#define CHANNELS     2 // стерео
-#define AMP          500
+#define SAMPLE_RATE_HZ              16000u
+#define FRAMES_PER_HALF    256u       // фреймов в половине буфера (~5.3мс)
+#define SLOTS              2u         // L,R
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+// какой слот занимает микрофон: 0=Left, 1=Right (INMP441 выбирается ножкой L/R)
+#ifndef MIC_SLOT_INDEX
+#define MIC_SLOT_INDEX 0
+#endif
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static int16_t sine_lut[TABLE_SIZE];
-static int16_t i2s_tx_buf[TABLE_SIZE * CHANNELS];
+// RX: 32-битные слова (слот 32), интерлив: L,R,L,R...
+static uint32_t rx_buf[FRAMES_PER_HALF * SLOTS * 2]; // две половины
+// TX: 32-битные слова (слот 32), интерлив: L,R,L,R...
+static uint32_t tx_buf[FRAMES_PER_HALF * SLOTS * 2];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-void PeriphCommonClock_Config(void);
 /* USER CODE BEGIN PFP */
+
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void FillSine(void)
-{
-    for (int i = 0; i < TABLE_SIZE; ++i) {
-        float t = (2.0f * 3.1415926535f * i) / TABLE_SIZE;
-        int16_t s = (int16_t)(AMP * sinf(t));
-        // interleaved L/R
-        i2s_tx_buf[2*i + 0] = 0; // Left
-        i2s_tx_buf[2*i + 1] = s; // Right (моно в стерео)
-    }
-}
+
 /* USER CODE END 0 */
 
 /**
@@ -96,9 +94,6 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
-  /* Configure the peripherals common clocks */
-  PeriphCommonClock_Config();
-
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
@@ -106,17 +101,12 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
-  MX_SAI1_Init();
-  MX_USART1_UART_Init();
+  MX_ADC1_Init();
+  MX_TIM6_Init();
+  MX_USART2_UART_Init();
+  MX_DAC1_Init();
   /* USER CODE BEGIN 2 */
-  FillSine();
 
-  // В HAL_SAI_Transmit_DMA "Size" — это КОЛ-ВО 16-БИТНЫХ элементов при DataSize=16
-  if (HAL_SAI_Transmit_DMA(&hsai_BlockA1,
-                            (uint8_t*)i2s_tx_buf,
-                            sizeof(i2s_tx_buf)/sizeof(uint16_t)) != HAL_OK) {
-      Error_Handler();
-  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -155,7 +145,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 8;
+  RCC_OscInitStruct.PLL.PLLN = 10;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -173,39 +163,34 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief Peripherals Common Clock Configuration
-  * @retval None
-  */
-void PeriphCommonClock_Config(void)
-{
-  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
-
-  /** Initializes the peripherals clock
-  */
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
-  PeriphClkInit.Sai1ClockSelection = RCC_SAI1CLKSOURCE_PLLSAI1;
-  PeriphClkInit.PLLSAI1.PLLSAI1Source = RCC_PLLSOURCE_HSI;
-  PeriphClkInit.PLLSAI1.PLLSAI1M = 1;
-  PeriphClkInit.PLLSAI1.PLLSAI1N = 16;
-  PeriphClkInit.PLLSAI1.PLLSAI1P = RCC_PLLP_DIV7;
-  PeriphClkInit.PLLSAI1.PLLSAI1Q = RCC_PLLQ_DIV2;
-  PeriphClkInit.PLLSAI1.PLLSAI1R = RCC_PLLR_DIV2;
-  PeriphClkInit.PLLSAI1.PLLSAI1ClockOut = RCC_PLLSAI1_SAI1CLK;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
 /* USER CODE BEGIN 4 */
+// --- TX колбэки: помечаем, какая половина сейчас играет ---
+// void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *h){
+//     if (h == &hsai_BlockA1) tx_playing_half = 1; // началась 2-я половина
+// }
+// void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *h){
+//     if (h == &hsai_BlockA1) tx_playing_half = 0; // началась 1-я половина
+// }
 
+// // --- RX колбэки: кладём микрофон в ПРОТИВОПОЛОЖНУЮ половину TX ---
+// void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *h){
+//     if (h == &hsai_BlockB1) {
+//         uint32_t safe_tx_half = tx_playing_half ^ 1;
+//         copy_rx_to_tx(/*rx_half=*/0, /*tx_half=*/safe_tx_half);
+//     }
+// }
+// void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *h){
+//     if (h == &hsai_BlockB1) {
+//         uint32_t safe_tx_half = tx_playing_half ^ 1;
+//         copy_rx_to_tx(/*rx_half=*/1, /*tx_half=*/safe_tx_half);
+//     }
+// }
 /* USER CODE END 4 */
 
 /**
