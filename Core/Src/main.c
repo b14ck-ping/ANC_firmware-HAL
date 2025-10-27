@@ -22,47 +22,101 @@
 #include "dac.h"
 #include "dma.h"
 #include "tim.h"
-#include "usart.h"
+#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <math.h>
+#include <stdbool.h>
+#include <string.h>
+#include "usbd_cdc_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ADC settings */
+#define VREF                3.3f
+#define ADC_MAX_CODE        4095.0f
+#define V_BIAS              1.25f      // MAX9814 output DC bias (V)
+#define MIC_GAIN_DB         40.0f      // software-set gain of MAX9814, dB
+
+/* Microphone capsule sensitivity (without preamp) in dBV (V per Pa = 
+10^(dBV/20)).
+   Typical electret values: -44 dBV (~6.31 mV/Pa), -36 dBV (~15.8 mV/Pa).
+   MUST be set according to the actual microphone capsule used.
+*/
+#define MIC_SENSITIVITY_DBV   (-44.0f) 
+
 #define SAMPLE_RATE_HZ              16000u
 #define FRAMES_PER_HALF    256u       // фреймов в половине буфера (~5.3мс)
 #define SLOTS              2u         // L,R
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-// какой слот занимает микрофон: 0=Left, 1=Right (INMP441 выбирается ножкой L/R)
-#ifndef MIC_SLOT_INDEX
-#define MIC_SLOT_INDEX 0
-#endif
+
+#pragma pack(push,1)
+typedef struct {
+    uint8_t pre0;
+    uint8_t pre1;
+    uint8_t id;     // 0 = ref, 1 = err
+    uint32_t cnt;
+    uint16_t q;      // quantized value = round(db * 100)  (int16)
+} usb_pkt_t;
+#pragma pack(pop)
 /* USER CODE END PM */
+
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-// RX: 32-битные слова (слот 32), интерлив: L,R,L,R...
-static uint32_t rx_buf[FRAMES_PER_HALF * SLOTS * 2]; // две половины
-// TX: 32-битные слова (слот 32), интерлив: L,R,L,R...
-static uint32_t tx_buf[FRAMES_PER_HALF * SLOTS * 2];
+/* ----------------- HAL handles (from MX_..._Init) ----------------- */
+extern ADC_HandleTypeDef hadc1;
+extern TIM_HandleTypeDef htim6;
+extern USBD_HandleTypeDef hUsbDeviceFS;
+/* ----------------- Globals ----------------- */
+/* ADC pair ring buffer (ref, err) - power of two recommended */
+/* ADC DMA Buffer */
+#define ADC_BUF_LEN         2U          // two channels scanned
+volatile uint16_t adc_buf[ADC_BUF_LEN]; // filled by DMA (make volatile)
+
+#define ADC_RING_SIZE       4096U       // must be power of two
+_Static_assert((ADC_RING_SIZE & (ADC_RING_SIZE - 1)) == 0, "ADC_RING_SIZE must be power of two");
+typedef struct { uint16_t ref; uint16_t err; } adc_pair_t;
+static volatile uint32_t adc_ring_head = 0, adc_ring_tail = 0;
+// static uint16_t adc_ring[ADC_RING_SIZE];
+static usb_pkt_t adc_ring[ADC_RING_SIZE];
+
+// static volatile uint32_t adc_dropped = 0;
+static volatile uint32_t sample_cnt = 0;
+
+
+/* Transmission batch */
+#define TX_BATCH_LEN        512U
+
+/* precomputed constants */
+static float mic_sens_v_per_pa;  // S (V/Pa)
+static float mic_gain_linear;    // G
+static const float p0 = 20e-6f;  // reference pressure 20 µPa
+
+extern volatile bool usb_busy;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-
+static float adc_to_db_spl(uint16_t raw);
+static inline bool adc_ring_push_isr(const adc_pair_t *p);
+static inline bool adc_ring_pop(/* adc_pair_t */usb_pkt_t *out);
+static void adc_ring_advance_tail(uint32_t count);
+static uint32_t adc_ring_count(void);
+static void usb_try_send_batch_peek(void);
 
 /* USER CODE END PFP */
 
@@ -102,11 +156,19 @@ int main(void)
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC1_Init();
-  MX_TIM6_Init();
-  MX_USART2_UART_Init();
   MX_DAC1_Init();
+  MX_TIM6_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
+  mic_sens_v_per_pa = powf(10.0f, MIC_SENSITIVITY_DBV / 20.0f); // V/Pa at gain=0dB
+  mic_gain_linear = powf(10.0f, MIC_GAIN_DB / 20.0f);
 
+  /* Start ADC in interrupt mode if necessary; if ADC triggered by TIM, HAL_ADC_Start_IT could be used */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED); // калибровка АЦП
+  if (HAL_TIM_Base_Start(&htim6) != HAL_OK) { Error_Handler(); }
+
+  // if (HAL_ADC_Start_IT(&hadc1) != HAL_OK) {Error_Handler();}
+  if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN)!= HAL_OK) {Error_Handler();}
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -116,7 +178,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    /* 2) Если USB готов — отправляем по USB. Используем peek-advance подход */
+    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED && !usb_busy) {
+        usb_try_send_batch_peek();
+    }
   }
+
   /* USER CODE END 3 */
 }
 
@@ -139,13 +206,14 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+  RCC_OscInitStruct.MSICalibrationValue = 0;
+  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 10;
+  RCC_OscInitStruct.PLL.PLLN = 16;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -163,34 +231,126 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
 /* USER CODE BEGIN 4 */
-// --- TX колбэки: помечаем, какая половина сейчас играет ---
-// void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *h){
-//     if (h == &hsai_BlockA1) tx_playing_half = 1; // началась 2-я половина
-// }
-// void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *h){
-//     if (h == &hsai_BlockA1) tx_playing_half = 0; // началась 1-я половина
-// }
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  (void)hadc;
+}
 
-// // --- RX колбэки: кладём микрофон в ПРОТИВОПОЛОЖНУЮ половину TX ---
-// void HAL_SAI_RxHalfCpltCallback(SAI_HandleTypeDef *h){
-//     if (h == &hsai_BlockB1) {
-//         uint32_t safe_tx_half = tx_playing_half ^ 1;
-//         copy_rx_to_tx(/*rx_half=*/0, /*tx_half=*/safe_tx_half);
-//     }
-// }
-// void HAL_SAI_RxCpltCallback(SAI_HandleTypeDef *h){
-//     if (h == &hsai_BlockB1) {
-//         uint32_t safe_tx_half = tx_playing_half ^ 1;
-//         copy_rx_to_tx(/*rx_half=*/1, /*tx_half=*/safe_tx_half);
-//     }
-// }
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+ (void)hadc;
+  /* fast: read both ADC values and push into adc_ring */
+  adc_pair_t p;
+  p.ref = adc_buf[0]; // rank1
+  p.err = adc_buf[1]; // rank2
+  // ISR-safe push
+  (void)adc_ring_push_isr(&p);
+}
+
+/* ----------------- processing ----------------- */
+/* Build one packet into a temporary buffer (like in uart_tx_buf) */
+static inline usb_pkt_t build_packet_bytes_from_rawpkt(uint16_t seq, uint32_t cnt)
+{
+  return (usb_pkt_t){.pre0 = 0xAA, .pre1 = 0x55, .id = 0, .cnt = cnt , .q = seq};
+}
+/* ----------------- Ring helpers ----------------- */
+/* ADC ring push (ISR-safe, fast) */
+static inline bool adc_ring_push_isr(const adc_pair_t *p)
+{
+    uint32_t head = adc_ring_head;
+    uint32_t next = (head + 1) & (ADC_RING_SIZE - 1);
+    adc_ring[head] = build_packet_bytes_from_rawpkt(p->err, ++sample_cnt);
+    adc_ring_head = next;
+    return true;
+}
+
+/* ADC ring pop (main) */
+static inline bool adc_ring_pop(usb_pkt_t *out)
+{
+    if (adc_ring_tail == adc_ring_head) return false;
+    *out = adc_ring[adc_ring_tail];
+    adc_ring_tail = (adc_ring_tail + 1) & (ADC_RING_SIZE - 1);
+    return true;
+}
+
+static inline bool adc_ring_peek_at(uint32_t offset, usb_pkt_t *out)
+{
+  uint32_t cnt = adc_ring_count();
+  if (offset >= cnt) return false;
+  uint32_t pos = (adc_ring_tail + offset) & (ADC_RING_SIZE - 1);
+  *out = adc_ring[pos];
+  return true;
+}
+
+static inline void adc_ring_advance_tail(uint32_t count)
+{
+    __disable_irq();
+    adc_ring_tail = (adc_ring_tail + count) & (ADC_RING_SIZE - 1);
+    __enable_irq();
+}
+
+static inline uint32_t adc_ring_count(void)
+{
+    uint32_t tail = 0, head = 0;
+    __disable_irq();
+    tail = adc_ring_tail;
+    head = adc_ring_head;
+    __enable_irq();
+    return (head - tail) & (ADC_RING_SIZE - 1);
+}
+
+/* ----------------- Conversion ADC->dB SPL ----------------- */
+static float adc_to_db_spl(uint16_t raw)
+{
+    float v_adc = ((float)raw) * VREF / ADC_MAX_CODE;
+    float v_sig = v_adc - V_BIAS;
+    float denom = mic_gain_linear * mic_sens_v_per_pa;
+    if (denom == 0.0f) denom = 1e-9f;
+    float p = v_sig / denom;
+    float ap = fabsf(p);
+    if (ap < 1e-12f) ap = 1e-12f;
+    float db = 20.0f * log10f(ap / p0);
+    return db;
+}
+
+static void usb_try_send_batch_peek(void)
+{
+    if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
+        usb_busy || adc_ring_count() < TX_BATCH_LEN) return;
+
+    uint32_t avail = adc_ring_count();
+    if (avail == 0) return;
+    uint32_t to_send = (avail > TX_BATCH_LEN) ? TX_BATCH_LEN : avail;
+
+    static usb_pkt_t sendbuf[TX_BATCH_LEN];
+
+    /* peek items into sendbuf without modifying tail */
+    for (uint32_t i = 0; i < to_send; ++i) {
+        if (!adc_ring_peek_at(i, &sendbuf[i])) {
+            to_send = i;
+            break;
+        }
+    }
+    if (to_send == 0) return;
+
+    uint8_t ret = CDC_Transmit_FS((uint8_t*)sendbuf, (uint16_t)(to_send * sizeof(usb_pkt_t)));
+    if (ret == USBD_OK) {
+        adc_ring_advance_tail(to_send);
+        usb_busy = true;
+    } else if (ret == USBD_BUSY) {
+        /* НЕ трогаем кольцо — попробуем позже. */
+    } else {
+        /* Ошибка — не теряем пакеты: просто попробуем позже. */
+    }
+}
+
 /* USER CODE END 4 */
 
 /**
