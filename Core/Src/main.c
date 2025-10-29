@@ -29,6 +29,7 @@
 /* USER CODE BEGIN Includes */
 #include <math.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include "usbd_cdc_if.h"
 /* USER CODE END Includes */
@@ -65,13 +66,12 @@
 typedef struct {
     uint8_t pre0;
     uint8_t pre1;
-    uint8_t id;     // 0 = ref, 1 = err
     uint32_t cnt;
-    uint16_t q;      // quantized value = round(db * 100)  (int16)
+    uint16_t err;
+    uint16_t ref;
 } usb_pkt_t;
 #pragma pack(pop)
 /* USER CODE END PM */
-
 
 /* Private variables ---------------------------------------------------------*/
 
@@ -98,22 +98,19 @@ static volatile uint32_t sample_cnt = 0;
 
 
 /* Transmission batch */
-#define TX_BATCH_LEN        512U
+#define TX_BATCH_LEN        32U
 
 /* precomputed constants */
 static float mic_sens_v_per_pa;  // S (V/Pa)
 static float mic_gain_linear;    // G
-static const float p0 = 20e-6f;  // reference pressure 20 µPa
-
+static volatile uint32_t adc_dropped = 0;
 extern volatile bool usb_busy;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static float adc_to_db_spl(uint16_t raw);
 static inline bool adc_ring_push_isr(const adc_pair_t *p);
-static inline bool adc_ring_pop(/* adc_pair_t */usb_pkt_t *out);
 static void adc_ring_advance_tail(uint32_t count);
 static uint32_t adc_ring_count(void);
 static void usb_try_send_batch_peek(void);
@@ -167,8 +164,8 @@ int main(void)
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED); // калибровка АЦП
   if (HAL_TIM_Base_Start(&htim6) != HAL_OK) { Error_Handler(); }
 
-  // if (HAL_ADC_Start_IT(&hadc1) != HAL_OK) {Error_Handler();}
   if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, ADC_BUF_LEN)!= HAL_OK) {Error_Handler();}
+  
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -179,9 +176,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     /* 2) Если USB готов — отправляем по USB. Используем peek-advance подход */
-    if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED && !usb_busy) {
-        usb_try_send_batch_peek();
-    }
+    // if (hUsbDeviceFS.dev_state == USBD_STATE_CONFIGURED && !usb_busy) {
+    //     usb_try_send_batch_peek();
+    // }
   }
 
   /* USER CODE END 3 */
@@ -206,14 +203,14 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
-  RCC_OscInitStruct.MSIState = RCC_MSI_ON;
-  RCC_OscInitStruct.MSICalibrationValue = 0;
-  RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_MSI;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 1;
-  RCC_OscInitStruct.PLL.PLLN = 16;
+  RCC_OscInitStruct.PLL.PLLN = 10;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
@@ -231,7 +228,7 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
   {
     Error_Handler();
   }
@@ -247,43 +244,47 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
  (void)hadc;
   /* fast: read both ADC values and push into adc_ring */
+      /* 
+      RANK_1 = PA6 = CH11 = err = green
+      RANK_2 = PA7 = CH12 = ref = yellow
+    */
   adc_pair_t p;
   p.ref = adc_buf[0]; // rank1
   p.err = adc_buf[1]; // rank2
   // ISR-safe push
   (void)adc_ring_push_isr(&p);
+  HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_3);
 }
 
 /* ----------------- processing ----------------- */
-/* Build one packet into a temporary buffer (like in uart_tx_buf) */
-static inline usb_pkt_t build_packet_bytes_from_rawpkt(uint16_t seq, uint32_t cnt)
-{
-  return (usb_pkt_t){.pre0 = 0xAA, .pre1 = 0x55, .id = 0, .cnt = cnt , .q = seq};
-}
 /* ----------------- Ring helpers ----------------- */
 /* ADC ring push (ISR-safe, fast) */
 static inline bool adc_ring_push_isr(const adc_pair_t *p)
 {
-    uint32_t head = adc_ring_head;
-    uint32_t next = (head + 1) & (ADC_RING_SIZE - 1);
-    adc_ring[head] = build_packet_bytes_from_rawpkt(p->err, ++sample_cnt);
-    adc_ring_head = next;
-    return true;
+  uint32_t head = adc_ring_head;
+  uint32_t next = (head + 1) & (ADC_RING_SIZE - 1);
+  uint32_t tail = adc_ring_tail; // tail может меняться в main, но чтение здесь "best-effort"
+  ++sample_cnt;
+  if (next == tail) {
+      // кольцо полно — отбрасываем пакет (не перезаписываем)
+      adc_dropped++;
+      return false;
+  }
+  adc_ring[head].pre0 = 0xAA;
+  adc_ring[head].pre1 = 0x55;
+  adc_ring[head].cnt  = sample_cnt;
+  adc_ring[head].err  = p->err;
+  adc_ring[head].ref  = p->ref;
+  // publish
+   __asm__ volatile ("" ::: "memory"); // небольшая баррикада
+  adc_ring_head = next;
+  return true;
 }
 
 /* ADC ring pop (main) */
-static inline bool adc_ring_pop(usb_pkt_t *out)
-{
-    if (adc_ring_tail == adc_ring_head) return false;
-    *out = adc_ring[adc_ring_tail];
-    adc_ring_tail = (adc_ring_tail + 1) & (ADC_RING_SIZE - 1);
-    return true;
-}
-
 static inline bool adc_ring_peek_at(uint32_t offset, usb_pkt_t *out)
 {
-  uint32_t cnt = adc_ring_count();
-  if (offset >= cnt) return false;
+  if (offset >= adc_ring_count()) return false;
   uint32_t pos = (adc_ring_tail + offset) & (ADC_RING_SIZE - 1);
   *out = adc_ring[pos];
   return true;
@@ -298,35 +299,20 @@ static inline void adc_ring_advance_tail(uint32_t count)
 
 static inline uint32_t adc_ring_count(void)
 {
-    uint32_t tail = 0, head = 0;
-    __disable_irq();
-    tail = adc_ring_tail;
-    head = adc_ring_head;
-    __enable_irq();
-    return (head - tail) & (ADC_RING_SIZE - 1);
-}
-
-/* ----------------- Conversion ADC->dB SPL ----------------- */
-static float adc_to_db_spl(uint16_t raw)
-{
-    float v_adc = ((float)raw) * VREF / ADC_MAX_CODE;
-    float v_sig = v_adc - V_BIAS;
-    float denom = mic_gain_linear * mic_sens_v_per_pa;
-    if (denom == 0.0f) denom = 1e-9f;
-    float p = v_sig / denom;
-    float ap = fabsf(p);
-    if (ap < 1e-12f) ap = 1e-12f;
-    float db = 20.0f * log10f(ap / p0);
-    return db;
+  uint32_t tail = 0, head = 0;
+  __disable_irq();
+  tail = adc_ring_tail;
+  head = adc_ring_head;
+  __enable_irq();
+  return (head - tail) & (ADC_RING_SIZE - 1);
 }
 
 static void usb_try_send_batch_peek(void)
 {
+     uint32_t avail = adc_ring_count();
     if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED ||
-        usb_busy || adc_ring_count() < TX_BATCH_LEN) return;
+        usb_busy || avail < TX_BATCH_LEN || avail == 0) return;
 
-    uint32_t avail = adc_ring_count();
-    if (avail == 0) return;
     uint32_t to_send = (avail > TX_BATCH_LEN) ? TX_BATCH_LEN : avail;
 
     static usb_pkt_t sendbuf[TX_BATCH_LEN];
